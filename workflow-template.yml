@@ -1,0 +1,232 @@
+name: "🔍 Collecte des vulnérabilités"
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # tous les jours à 06h00 UTC
+  workflow_dispatch:        # déclenchement manuel possible
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  collect-and-deploy:
+    name: Collecter & Déployer
+    runs-on: ubuntu-latest
+    steps:
+
+      # ── 1. Checkout ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Collect vulnerability data ────────────────────────────
+      - name: Collect vulnerabilities from GitHub API
+        env:
+          SCANNER_TOKEN: ${{ secrets.SECURITY_SCANNER_TOKEN }}
+          ORG: DSI-MARJANEGROUP
+        run: |
+          set -euo pipefail
+
+          TOKEN="${SCANNER_TOKEN}"
+          ORG="${ORG}"
+          GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "🔍 Fetching repositories..."
+
+          # Fetch all repos (up to 1000)
+          ALL_REPOS="[]"
+          PAGE=1
+          while true; do
+            BATCH=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/$ORG/repos?per_page=100&page=$PAGE&type=all" || echo "[]")
+            COUNT=$(echo "$BATCH" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))")
+            ALL_REPOS=$(echo "$ALL_REPOS $BATCH" | python3 -c "
+          import sys, json
+          parts = sys.stdin.read().split(' ', 1)
+          a = json.loads(parts[0])
+          b = json.loads(parts[1])
+          print(json.dumps(a + b))")
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          REPO_NAMES=$(echo "$ALL_REPOS" | python3 -c "
+          import sys, json
+          repos = json.load(sys.stdin)
+          print('\n'.join(r['name'] for r in repos))")
+
+          echo "📦 Found $(echo "$REPO_NAMES" | wc -l) repositories"
+
+          # Accumulate per-repo data
+          REPOS_JSON="[]"
+          TOTAL_CRITICAL=0; TOTAL_HIGH=0; TOTAL_MEDIUM=0; TOTAL_LOW=0
+          TOTAL_DEPENDABOT=0; TOTAL_CODE=0; TOTAL_SECRETS=0
+
+          while IFS= read -r REPO; do
+            [ -z "$REPO" ] && continue
+
+            # Helper: paginate GitHub alerts endpoint
+            fetch_all_alerts() {
+              local URL="$1"
+              local ALL="[]"
+              local P=1
+              while true; do
+                local BATCH
+                BATCH=$(curl -sf \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${URL}?per_page=100&page=${P}&state=open" 2>/dev/null || echo "[]")
+                local CNT
+                CNT=$(echo "$BATCH" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+                ALL=$(printf '%s\n%s' "$ALL" "$BATCH" | python3 -c "
+          import sys, json
+          data = sys.stdin.read().strip()
+          idx = data.index('\n')
+          a = json.loads(data[:idx])
+          b = json.loads(data[idx+1:])
+          print(json.dumps(a+b))" 2>/dev/null || echo "$ALL")
+                [ "$CNT" -lt 100 ] && break
+                P=$((P+1))
+              done
+              echo "$ALL"
+            }
+
+            # --- Dependabot alerts ---
+            DEPENDABOT=$(fetch_all_alerts "https://api.github.com/repos/$ORG/$REPO/dependabot/alerts")
+            DEP_COUNTS=$(echo "$DEPENDABOT" | python3 -c "
+          import sys, json
+          alerts = json.load(sys.stdin)
+          c = h = m = l = 0
+          for a in alerts:
+              sev = (a.get('security_advisory') or {}).get('severity','').lower()
+              if sev == 'critical': c += 1
+              elif sev == 'high': h += 1
+              elif sev == 'medium': m += 1
+              else: l += 1
+          print(f'{c} {h} {m} {l}')
+          " 2>/dev/null || echo "0 0 0 0")
+            DEP_TOTAL=$(echo "$DEPENDABOT" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+
+            # --- Code scanning alerts ---
+            CODE=$(fetch_all_alerts "https://api.github.com/repos/$ORG/$REPO/code-scanning/alerts")
+            CODE_COUNTS=$(echo "$CODE" | python3 -c "
+          import sys, json
+          alerts = json.load(sys.stdin)
+          c = h = m = l = 0
+          for a in alerts:
+              sev = (a.get('rule') or {}).get('severity','').lower()
+              if sev == 'critical' or sev == 'error': c += 1
+              elif sev == 'high' or sev == 'warning': h += 1
+              elif sev == 'medium' or sev == 'note': m += 1
+              else: l += 1
+          print(f'{c} {h} {m} {l}')
+          " 2>/dev/null || echo "0 0 0 0")
+            CODE_TOTAL=$(echo "$CODE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+
+            # --- Secret scanning alerts ---
+            SECRETS=$(fetch_all_alerts "https://api.github.com/repos/$ORG/$REPO/secret-scanning/alerts")
+            SECRETS_TOTAL=$(echo "$SECRETS" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+
+            # Merge counts
+            REPO_DATA=$(python3 -c "
+          dep='$DEP_COUNTS'.split()
+          code='$CODE_COUNTS'.split()
+          dc,dh,dm,dl = int(dep[0]),int(dep[1]),int(dep[2]),int(dep[3])
+          cc,ch,cm,cl = int(code[0]),int(code[1]),int(code[2]),int(code[3])
+          sc = sh = sm = 0; sl = $SECRETS_TOTAL
+          c=dc+cc+sc; h=dh+ch+sh; m=dm+cm+sm; l=dl+cl+sl
+          total=c+h+m+l
+          import json
+          print(json.dumps({'name':'$REPO','total':total,'critical':c,'high':h,'medium':m,'low':l,'dependabot':$DEP_TOTAL,'code_scanning':$CODE_TOTAL,'secret_scanning':$SECRETS_TOTAL}))
+          ")
+
+            REPO_TOTAL=$(echo "$REPO_DATA"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total'])")
+            [ "$REPO_TOTAL" -gt 0 ] && REPOS_JSON=$(echo "$REPOS_JSON" | python3 -c "
+          import sys, json
+          import os
+          arr = json.load(sys.stdin)
+          arr.append(json.loads(os.environ.get('REPO_DATA','${REPO_DATA}')))
+          print(json.dumps(arr))" REPO_DATA="$REPO_DATA" 2>/dev/null || echo "$REPOS_JSON")
+
+            # Accumulate totals
+            R_C=$(echo "$REPO_DATA" | python3 -c "import sys,json; print(json.load(sys.stdin)['critical'])")
+            R_H=$(echo "$REPO_DATA" | python3 -c "import sys,json; print(json.load(sys.stdin)['high'])")
+            R_M=$(echo "$REPO_DATA" | python3 -c "import sys,json; print(json.load(sys.stdin)['medium'])")
+            R_L=$(echo "$REPO_DATA" | python3 -c "import sys,json; print(json.load(sys.stdin)['low'])")
+            TOTAL_CRITICAL=$((TOTAL_CRITICAL + R_C))
+            TOTAL_HIGH=$((TOTAL_HIGH + R_H))
+            TOTAL_MEDIUM=$((TOTAL_MEDIUM + R_M))
+            TOTAL_LOW=$((TOTAL_LOW + R_L))
+            TOTAL_DEPENDABOT=$((TOTAL_DEPENDABOT + DEP_TOTAL))
+            TOTAL_CODE=$((TOTAL_CODE + CODE_TOTAL))
+            TOTAL_SECRETS=$((TOTAL_SECRETS + SECRETS_TOTAL))
+
+          done <<< "$REPO_NAMES"
+
+          GRAND_TOTAL=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
+          echo "✅ Total: $GRAND_TOTAL (C:$TOTAL_CRITICAL H:$TOTAL_HIGH M:$TOTAL_MEDIUM L:$TOTAL_LOW)"
+
+          # Build and persist history (keep last 30 days)
+          HISTORY="[]"
+          [ -f data/vulnerabilities.json ] && \
+            HISTORY=$(python3 -c "import json; d=json.load(open('data/vulnerabilities.json')); print(json.dumps(d.get('history',[])))") || true
+
+          HISTORY=$(python3 -c "
+          import json, sys
+          h = json.loads('$HISTORY')
+          h.append({'date':'$GENERATED_AT','total':$GRAND_TOTAL,'critical':$TOTAL_CRITICAL,'high':$TOTAL_HIGH,'medium':$TOTAL_MEDIUM,'low':$TOTAL_LOW})
+          h = h[-30:]   # keep last 30 entries
+          print(json.dumps(h))
+          ")
+
+          # Final JSON
+          python3 - <<PYEOF
+          import json
+          repos = json.loads('''$REPOS_JSON''')
+          history = json.loads('''$HISTORY''')
+          output = {
+              "generated_at": "$GENERATED_AT",
+              "org": "$ORG",
+              "summary": {
+                  "total": $GRAND_TOTAL,
+                  "critical": $TOTAL_CRITICAL,
+                  "high": $TOTAL_HIGH,
+                  "medium": $TOTAL_MEDIUM,
+                  "low": $TOTAL_LOW,
+                  "dependabot": $TOTAL_DEPENDABOT,
+                  "code_scanning": $TOTAL_CODE,
+                  "secret_scanning": $TOTAL_SECRETS
+              },
+              "repositories": sorted(repos, key=lambda r: -r["total"]),
+              "history": history
+          }
+          with open("data/vulnerabilities.json","w") as f:
+              json.dump(output, f, indent=2, ensure_ascii=False)
+          print("📄 data/vulnerabilities.json written")
+          PYEOF
+
+      # ── 3. Commit data ───────────────────────────────────────────
+      - name: Commit updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/vulnerabilities.json
+          git diff --cached --quiet || git commit -m "chore: mise à jour des vulnérabilités [$(date -u +%Y-%m-%d)]"
+          git push
+
+      # ── 4. Deploy GitHub Pages ───────────────────────────────────
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "."
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
