@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-04-30T10:00:00Z",
+  "org": "DSI-MARJANEGROUP",
+  "summary": {
+    "total": 0,
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "dependabot": 0,
+    "code_scanning": 0,
+    "secret_scanning": 0
+  },
+  "repositories": [],
+  "history": []
+}
