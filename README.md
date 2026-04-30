@@ -21,23 +21,15 @@ Tableau de bord consolidé pour visualiser les vulnérabilités de l'ensemble de
 2. Source : **GitHub Actions**
 3. Sauvegarder
 
-### Étape 4 — Pousser le workflow (une seule fois)
+### Étape 4 — Activer le workflow de collecte (via l'interface GitHub)
 
-Depuis un terminal avec `gh` CLI ou git configuré avec le token (scope `workflow`) :
+1. Aller dans ce dépôt sur GitHub.com
+2. Cliquer **"Add file"** → **"Create new file"**
+3. Dans le champ de nom, taper : `.github/workflows/scrape-vulnerabilities.yml`
+4. Copier-coller le contenu du fichier **`workflow-template.yml`** présent dans ce dépôt
+5. Cliquer **"Commit changes"**
 
-```bash
-git clone https://github.com/DSI-MARJANEGROUP/demo-dashboard-vul.git
-cd demo-dashboard-vul
-mkdir -p .github/workflows
-```
-
-Créer le fichier `.github/workflows/scrape-vulnerabilities.yml` avec le contenu du fichier `workflow-template.yml` présent dans ce dépôt, puis :
-
-```bash
-git add .github/workflows/scrape-vulnerabilities.yml
-git commit -m "feat: workflow de collecte des vulnérabilités"
-git push
-```
+Le workflow s'exécutera automatiquement et le tableau de bord se mettra à jour !
 
 ---
 
